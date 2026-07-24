@@ -14,7 +14,4 @@ jobs:
           distribution: temurin
           java-version: 21
       - name: Run tests
-        run: |
-          sed -i 's/\r$//' gradlew
-          chmod +x gradlew
-          ./gradlew test --no-daemon
+        run: ./gradlew test --no-daemon
