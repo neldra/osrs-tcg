@@ -25,11 +25,14 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import javax.imageio.ImageIO;
 import javax.imageio.ImageReadParam;
@@ -86,6 +89,17 @@ public class WikiImageCacheService
 	/** ARGB byte estimate of everything in {@link #memoryCache}; guarded by its mutex. */
 	private long memoryCacheBytes;
 	private final Map<String, CompletableFuture<BufferedImage>> loadingFutures = new ConcurrentHashMap<>();
+	/**
+	 * Single lane for {@link #loadDiskOnly} decodes; on the shared loader pool they would
+	 * queue behind in-flight network fetches. Idle thread times out, so no shutdown hook.
+	 */
+	private final ExecutorService diskOnlyExecutor = new ThreadPoolExecutor(
+		0, 1, 30, TimeUnit.SECONDS, new LinkedBlockingQueue<>(), r ->
+		{
+			Thread t = new Thread(r, "osrs-tcg-wiki-disk-only");
+			t.setDaemon(true);
+			return t;
+		});
 	/** URLs that failed to load; skip re-fetching on the overlay/album paint path. */
 	private final Set<String> failedUrls = ConcurrentHashMap.newKeySet();
 	/**
@@ -159,9 +173,10 @@ public class WikiImageCacheService
 
 	/**
 	 * Starts loads for the given URLs and blocks until each has settled in memory or failed,
-	 * or until {@code timeoutMs} elapses. Safe to call off the EDT (e.g. before applying an album page).
+	 * or until {@code timeoutMs} elapses. Blocking; never call on the EDT — UI paths use
+	 * {@link #preload} and repaint as loads settle. Visible for tests as a sync point.
 	 */
-	public void preloadAndAwait(Collection<String> urls, long timeoutMs)
+	void preloadAndAwait(Collection<String> urls, long timeoutMs)
 	{
 		if (urls == null || urls.isEmpty())
 		{
@@ -271,6 +286,47 @@ public class WikiImageCacheService
 			return null;
 		}
 		return memoryCache.get(normalized);
+	}
+
+	/**
+	 * Fly-by load: delivers the URL's art from memory or the disk cache without admitting
+	 * it to the memory cache and without any network fetch; the callback receives null on
+	 * a miss. Decodes run on their own single lane so scroll-past pages never queue behind
+	 * network loads; the callback may run on the calling thread when served from memory.
+	 * Jobs whose {@code stillWanted} turns false by decode time are dropped without a
+	 * callback, so a scroll-spree's leftovers cannot delay the landed page's decodes.
+	 */
+	public void loadDiskOnly(String url, BooleanSupplier stillWanted, Consumer<BufferedImage> onLoaded)
+	{
+		if (onLoaded == null || stillWanted == null)
+		{
+			return;
+		}
+		String normalized = normalizeUrl(url);
+		if (normalized.isEmpty())
+		{
+			onLoaded.accept(null);
+			return;
+		}
+		BufferedImage cached = memoryCache.get(normalized);
+		if (cached != null)
+		{
+			onLoaded.accept(cached);
+			return;
+		}
+		diskOnlyExecutor.execute(() ->
+		{
+			if (!stillWanted.getAsBoolean())
+			{
+				return;
+			}
+			BufferedImage image = tryLoadThumbnail(normalized);
+			if (image == null)
+			{
+				image = tryLoadFromDisk(normalized);
+			}
+			onLoaded.accept(image);
+		});
 	}
 
 	/** Runs work on the wiki-image background pool (disk decode / card-face rasterization). */
