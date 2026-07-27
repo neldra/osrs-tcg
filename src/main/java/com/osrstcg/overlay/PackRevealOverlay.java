@@ -76,6 +76,7 @@ public class PackRevealOverlay extends Overlay
 	private final PackRevealSoundService packRevealSoundService;
 	private final TcgStateService tcgStateService;
 	private final OsrsTcgConfig config;
+	private final GlowRenderer glowRenderer = new GlowRenderer();
 
 	/** {@link Double#NaN} until the wheel adjusts zoom this session; then a clamped multiplier on top of the fitted layout. */
 	private volatile double sessionPackZoomMultiplier = Double.NaN;
@@ -191,7 +192,7 @@ public class PackRevealOverlay extends Overlay
 					Rectangle packGlowRect = uniformInset(
 						packImageDrawRect(packScaled, snap.getBoosterPackId()),
 						PACK_SEALED_GLOW_INSET);
-					drawGlow(graphics, packGlowRect, RarityMath.Tier.GODLY.getColor(), glowAlpha);
+					drawGlow(graphics, packGlowRect, RarityMath.Tier.GODLY.getColor(), glowAlpha, false);
 				}
 			}
 			else
@@ -230,10 +231,15 @@ public class PackRevealOverlay extends Overlay
 			drawOrder.add(i);
 		}
 		drawOrder.sort(Comparator.comparingDouble(i -> cardHoverLift[i]));
+		RevealCardVisual[] visuals = new RevealCardVisual[cards.size()];
+		for (int i = 0; i < cards.size(); i++)
+		{
+			visuals[i] = revealCardVisual(i, bounds.get(i), snap);
+		}
 		for (int i : drawOrder)
 		{
 			PackRevealService.RevealCard card = cards.get(i);
-			RevealCardVisual visual = revealCardVisual(i, bounds.get(i), snap);
+			RevealCardVisual visual = visuals[i];
 			Rectangle r = visual.rect;
 			boolean faceUp = visual.faceUp;
 			double lift = visual.lift;
@@ -241,7 +247,7 @@ public class PackRevealOverlay extends Overlay
 
 			if(config.packRarityHighlight() || (faceUp && !config.packRarityHighlight()))
 			{
-				drawGlow(graphics, r, card.getRarityColor(), glowAlpha);
+				drawGlow(graphics, r, card.getRarityColor(), glowAlpha, faceUp);
 			}
 			if (faceUp)
 			{
@@ -264,7 +270,7 @@ public class PackRevealOverlay extends Overlay
 		for (int i : drawOrder)
 		{
 			PackRevealService.RevealCard card = cards.get(i);
-			RevealCardVisual visual = revealCardVisual(i, bounds.get(i), snap);
+			RevealCardVisual visual = visuals[i];
 			Rectangle r = visual.rect;
 			boolean faceUp = visual.faceUp;
 			double lift = visual.lift;
@@ -638,49 +644,20 @@ public class PackRevealOverlay extends Overlay
 		return new Rectangle(r.x + inset, r.y + inset, nw, nh);
 	}
 
-	private void drawGlow(Graphics2D g, Rectangle r, Color color, float alpha)
-	{
-		drawGlow(g, r, color, alpha, 26f, 18, 20);
-	}
-
 	/**
-	 * @param maxExpand outer halo reach in pixels (smaller = tighter around {@code r})
+	 * @param steady true when the alpha is frame-stable (face-up cards): the glow blits
+	 *               from a pre-rendered cache instead of re-filling the layered rects on
+	 *               the game render thread. Animated alphas (hover lift, pack glow) pass
+	 *               false and draw direct.
 	 */
-	private void drawGlow(Graphics2D g, Rectangle r, Color color, float alpha, float maxExpand, int layers, int baseArc)
+	private void drawGlow(Graphics2D g, Rectangle r, Color color, float alpha, boolean steady)
 	{
-		Color glow = color == null ? Color.WHITE : color;
-		float clampedAlpha = Math.max(0f, Math.min(1f, alpha));
-		if (clampedAlpha <= 0.01f)
+		if (steady)
 		{
+			glowRenderer.drawCachedGlow(g, r, color, alpha);
 			return;
 		}
-
-		Graphics2D g2 = (Graphics2D) g.create();
-		try
-		{
-			// Stable soft edge glow from card bounds.
-			for (int i = layers; i >= 1; i--)
-			{
-				float t = (float) i / (float) layers; // 1 near card, 0 far.
-				int expand = Math.max(1, Math.round((1.0f - t) * maxExpand));
-				float falloff = t * t; // smooth quadratic falloff
-				float layerAlpha = clampedAlpha * falloff * 0.34f;
-				g2.setColor(withAlpha(glow, layerAlpha));
-				int arc = baseArc + expand;
-				g2.fillRoundRect(
-					r.x - expand,
-					r.y - expand,
-					r.width + (expand * 2),
-					r.height + (expand * 2),
-					arc,
-					arc
-				);
-			}
-		}
-		finally
-		{
-			g2.dispose();
-		}
+		GlowRenderer.paintGlow(g, r, color, alpha);
 	}
 
 	private static int naturalGridWidth(int count)
@@ -819,7 +796,7 @@ public class PackRevealOverlay extends Overlay
 		{
 			PackRevealService.RevealCard card = cards.get(i);
 			Rectangle r = rects.get(i);
-			drawGlow(graphics, r, card.getRarityColor(), 0f);
+			drawGlow(graphics, r, card.getRarityColor(), 0f, false);
 			SharedCardRenderer.drawCardBack(graphics, r, card.getPull().isFoil(), card.getRarityColor());
 		}
 	}
