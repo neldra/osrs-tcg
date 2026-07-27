@@ -6,6 +6,7 @@ import com.osrstcg.ui.SharedCardRenderer;
 import java.awt.AlphaComposite;
 import java.awt.BasicStroke;
 import java.awt.Color;
+import java.awt.Composite;
 import java.awt.Dimension;
 import java.awt.Graphics;
 import java.awt.Graphics2D;
@@ -16,7 +17,15 @@ import java.awt.event.MouseEvent;
 import java.awt.image.BufferedImage;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
@@ -45,14 +54,40 @@ final class CollectionAlbumGridPanel extends JPanel
 	private List<Rectangle> lastCardBounds = Collections.emptyList();
 	private int selectedIndex = -1;
 
+	/**
+	 * Art delivered by fly-by disk loads, held only for the current slot list (cleared on
+	 * the next {@link #setSlots}) — never admitted to the service's memory cache, so
+	 * scroll sprees cannot churn the LRU. Read by the raster lane, written on the EDT.
+	 */
+	private final Map<String, BufferedImage> transientArt = new ConcurrentHashMap<>();
+	/** Bumped on every setSlots; fly-by callbacks from a left page check it and drop. */
+	private final AtomicLong slotsGen = new AtomicLong();
+
 	/** Off-EDT rasterized card faces (no animated foil overlays); painted via blit only. */
 	private BufferedImage[] faceRasters = new BufferedImage[0];
+	/**
+	 * The same slots' rasters at the previous size, scale-blitted while a resize
+	 * re-rasters — cheaper than re-drawing faces on the EDT during a drag-resize.
+	 */
+	private BufferedImage[] prevFaceRasters = new BufferedImage[0];
 	private int faceRasterW;
 	private int faceRasterH;
 	private final AtomicLong faceRasterGen = new AtomicLong();
 	/** Generation currently being rasterized; avoids re-queueing every paint while faces load. */
 	private long scheduledFaceGen = -1L;
 	private final AtomicBoolean faceRepaintScheduled = new AtomicBoolean();
+	/**
+	 * Own lane for face rasterization (pure CPU, ~1ms/face). On the shared wiki-image pool
+	 * these jobs would queue behind pending network decodes, leaving the grid blank for the
+	 * duration of a cold page load. Idle thread times out, so no shutdown hook is needed.
+	 */
+	private final ExecutorService faceRasterExecutor = new ThreadPoolExecutor(
+		0, 1, 30, TimeUnit.SECONDS, new LinkedBlockingQueue<>(), r ->
+		{
+			Thread t = new Thread(r, "osrs-tcg-album-face-raster");
+			t.setDaemon(true);
+			return t;
+		});
 
 	CollectionAlbumGridPanel(WikiImageCacheService imageCacheService,
 		BiConsumer<Integer, AlbumSlot> ownedMultiCopyPressed,
@@ -238,8 +273,65 @@ final class CollectionAlbumGridPanel extends JPanel
 			selectedIndex = -1;
 		}
 		invalidateFaceRasters();
+		// Same-page refreshes (lock toggles, pulls) keep their fly-by art; left pages drop.
+		transientArt.keySet().retainAll(normalizedUrls(slots));
+		requestFlyByArt(slotsGen.incrementAndGet());
 		repaint();
 		onSelectionChanged.run();
+	}
+
+	private Set<String> normalizedUrls(List<AlbumSlot> forSlots)
+	{
+		Set<String> urls = new HashSet<>();
+		for (AlbumSlot slot : forSlots)
+		{
+			CardDefinition card = slot == null ? null : slot.card();
+			String url = card == null ? null : card.getImageUrl();
+			if (url != null && !url.isEmpty())
+			{
+				urls.add(imageCacheService.normalizeImageUrl(url));
+			}
+		}
+		return urls;
+	}
+
+	/**
+	 * Fly-by tier: a page applied mid-scroll decodes its disk-cached art immediately —
+	 * only network fetches stay settle-gated (in the window's preload path). Art lands in
+	 * {@link #transientArt} and re-rasters its face in place.
+	 */
+	private void requestFlyByArt(long gen)
+	{
+		for (AlbumSlot slot : slots)
+		{
+			CardDefinition card = slot == null ? null : slot.card();
+			String url = card == null ? null : card.getImageUrl();
+			if (url == null || url.isEmpty() || imageCacheService.isInMemory(url))
+			{
+				continue;
+			}
+			String normalized = imageCacheService.normalizeImageUrl(url);
+			if (transientArt.containsKey(normalized))
+			{
+				continue;
+			}
+			imageCacheService.loadDiskOnly(url, () -> gen == slotsGen.get(), image ->
+			{
+				if (image == null)
+				{
+					return;
+				}
+				SwingUtilities.invokeLater(() ->
+				{
+					if (gen != slotsGen.get())
+					{
+						return;
+					}
+					transientArt.put(normalized, image);
+					refreshFaceForUrl(normalized);
+				});
+			});
+		}
 	}
 
 	boolean hasVisibleFoilCards()
@@ -254,11 +346,28 @@ final class CollectionAlbumGridPanel extends JPanel
 		return false;
 	}
 
-	/** Re-rasterize faces after wiki art arrives in memory (previous rasters may lack art). */
-	void refreshFacesAfterImageLoad()
+	/**
+	 * Re-renders just the face(s) whose card art matches the settled URL, swapping each
+	 * raster in place — every other face stays on screen untouched.
+	 */
+	void refreshFaceForUrl(String normalizedUrl)
 	{
-		invalidateFaceRasters();
-		repaint();
+		if (normalizedUrl == null || normalizedUrl.isEmpty()
+			|| slots.isEmpty() || faceRasterW <= 0 || faceRasterH <= 0)
+		{
+			return;
+		}
+		final long gen = faceRasterGen.get();
+		for (int i = 0; i < slots.size(); i++)
+		{
+			AlbumSlot slot = slots.get(i);
+			CardDefinition card = slot == null ? null : slot.card();
+			String url = card == null ? null : card.getImageUrl();
+			if (url != null && normalizedUrl.equals(imageCacheService.normalizeImageUrl(url)))
+			{
+				rasterizeSlotInto(gen, faceRasterW, faceRasterH, i, slot);
+			}
+		}
 	}
 
 	private void invalidateFaceRasters()
@@ -266,6 +375,7 @@ final class CollectionAlbumGridPanel extends JPanel
 		faceRasterGen.incrementAndGet();
 		scheduledFaceGen = -1L;
 		faceRasters = new BufferedImage[slots.size()];
+		prevFaceRasters = new BufferedImage[0];
 		faceRasterW = 0;
 		faceRasterH = 0;
 	}
@@ -284,40 +394,50 @@ final class CollectionAlbumGridPanel extends JPanel
 			return;
 		}
 
+		if (faceRasterW > 0 && faceRasters.length == slots.size())
+		{
+			prevFaceRasters = faceRasters;
+		}
 		faceRasterW = cW;
 		faceRasterH = cH;
 		faceRasters = new BufferedImage[slots.size()];
 		final long gen = faceRasterGen.incrementAndGet();
 		scheduledFaceGen = gen;
-		final List<AlbumSlot> snap = new ArrayList<>(slots);
-		final int width = cW;
-		final int height = cH;
+		rasterizeSlotsInto(gen, cW, cH, new ArrayList<>(slots));
+	}
+
+	/** Rasterizes each slot off-EDT and swaps it into {@link #faceRasters} while {@code gen} is current. */
+	private void rasterizeSlotsInto(long gen, int width, int height, List<AlbumSlot> snap)
+	{
 		for (int i = 0; i < snap.size(); i++)
 		{
-			final int index = i;
-			final AlbumSlot slot = snap.get(i);
-			imageCacheService.executeBackground(() ->
+			rasterizeSlotInto(gen, width, height, i, snap.get(i));
+		}
+	}
+
+	private void rasterizeSlotInto(long gen, int width, int height, int index, AlbumSlot slot)
+	{
+		faceRasterExecutor.execute(() ->
+		{
+			if (gen != faceRasterGen.get())
+			{
+				return;
+			}
+			BufferedImage raster = rasterizeFace(slot, width, height);
+			SwingUtilities.invokeLater(() ->
 			{
 				if (gen != faceRasterGen.get())
 				{
 					return;
 				}
-				BufferedImage raster = rasterizeFace(slot, width, height);
-				SwingUtilities.invokeLater(() ->
+				if (index >= faceRasters.length)
 				{
-					if (gen != faceRasterGen.get())
-					{
-						return;
-					}
-					if (index >= faceRasters.length)
-					{
-						return;
-					}
-					faceRasters[index] = raster;
-					scheduleCoalescedRepaint();
-				});
+					return;
+				}
+				faceRasters[index] = raster;
+				scheduleCoalescedRepaint();
 			});
-		}
+		});
 	}
 
 	private void scheduleCoalescedRepaint()
@@ -333,6 +453,17 @@ final class CollectionAlbumGridPanel extends JPanel
 		});
 	}
 
+	/** Memory-cached art first, then fly-by art held for the current page. Any-thread safe. */
+	private BufferedImage slotArt(String url)
+	{
+		if (url == null || url.isEmpty())
+		{
+			return null;
+		}
+		BufferedImage art = imageCacheService.getIfPresent(url);
+		return art != null ? art : transientArt.get(imageCacheService.normalizeImageUrl(url));
+	}
+
 	private BufferedImage rasterizeFace(AlbumSlot slot, int cW, int cH)
 	{
 		BufferedImage raster = new BufferedImage(cW, cH, BufferedImage.TYPE_INT_ARGB);
@@ -340,32 +471,35 @@ final class CollectionAlbumGridPanel extends JPanel
 		try
 		{
 			CardDefinition card = slot == null ? null : slot.card();
-			Color rarity = slot == null ? Color.WHITE : slot.rarityColor();
-			boolean foil = slot != null && slot.displayFoil();
-			boolean owned = slot != null && slot.ownedAny();
-			BufferedImage art = imageCacheService.getIfPresent(card == null ? null : card.getImageUrl());
-			Rectangle bounds = new Rectangle(0, 0, cW, cH);
-			boolean foilScoreLabel = owned && foil;
-			if (!owned)
-			{
-				g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, 0.3f));
-			}
-			// Static face only — animated foil overlays are drawn on the EDT blit path.
-			SharedCardRenderer.drawCardFace(g2, bounds, card, foil, rarity, art, 0L, foilScoreLabel, false);
-			if (slot != null && slot.lockBadge())
-			{
-				SharedCardRenderer.drawLockBadge(g2, bounds);
-			}
-			if (!owned)
-			{
-				g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, 1.0f));
-			}
+			drawStaticFace(g2, new Rectangle(0, 0, cW, cH), slot,
+				slotArt(card == null ? null : card.getImageUrl()));
 		}
 		finally
 		{
 			g2.dispose();
 		}
 		return raster;
+	}
+
+	/** Static face only — animated foil overlays are drawn on the EDT blit path. */
+	private static void drawStaticFace(Graphics2D g2, Rectangle bounds, AlbumSlot slot, BufferedImage art)
+	{
+		CardDefinition card = slot == null ? null : slot.card();
+		Color rarity = slot == null ? Color.WHITE : slot.rarityColor();
+		boolean foil = slot != null && slot.displayFoil();
+		boolean owned = slot != null && slot.ownedAny();
+		boolean foilScoreLabel = owned && foil;
+		Composite prev = g2.getComposite();
+		if (!owned)
+		{
+			g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, 0.3f));
+		}
+		SharedCardRenderer.drawCardFace(g2, bounds, card, foil, rarity, art, 0L, foilScoreLabel, false);
+		if (slot != null && slot.lockBadge())
+		{
+			SharedCardRenderer.drawLockBadge(g2, bounds);
+		}
+		g2.setComposite(prev);
 	}
 
 	@Override
@@ -454,8 +588,25 @@ final class CollectionAlbumGridPanel extends JPanel
 				}
 				else
 				{
-					g2.setColor(PLACEHOLDER_FACE);
-					g2.fillRoundRect(bounds.x, bounds.y, bounds.width, bounds.height, 8, 8);
+					BufferedImage prev = i < prevFaceRasters.length ? prevFaceRasters[i] : null;
+					CardDefinition card = slot == null ? null : slot.card();
+					BufferedImage art = prev == null ? slotArt(card == null ? null : card.getImageUrl()) : null;
+					if (prev != null)
+					{
+						// Mid-resize: the old raster scale-blits until the new one lands.
+						g2.drawImage(prev, bounds.x, bounds.y, bounds.width, bounds.height, null);
+					}
+					else if (art != null)
+					{
+						// Warm art paints the same frame the page applies; the raster
+						// swaps in underneath on a later frame.
+						drawStaticFace(g2, bounds, slot, art);
+					}
+					else
+					{
+						g2.setColor(PLACEHOLDER_FACE);
+						g2.fillRoundRect(bounds.x, bounds.y, bounds.width, bounds.height, 8, 8);
+					}
 				}
 
 				// Continuous foil sparkles + sheen (sheen is a no-op most of the cycle).

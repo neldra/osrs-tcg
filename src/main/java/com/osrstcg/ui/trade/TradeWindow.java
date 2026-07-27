@@ -6,6 +6,7 @@ import com.osrstcg.service.CardPartyTradeService;
 import com.osrstcg.service.CardPartyTradeService.TradeOfferView;
 import com.osrstcg.service.CardPartyTradeService.TradeSessionView;
 import com.osrstcg.service.WikiImageCacheService;
+import com.osrstcg.ui.ImageRepaintCoalescer;
 import com.osrstcg.ui.SharedCardRenderer;
 import com.osrstcg.ui.collectionalbum.AlbumInstanceTooltip;
 import java.awt.BorderLayout;
@@ -34,7 +35,6 @@ import javax.swing.JPanel;
 import javax.swing.JScrollPane;
 import javax.swing.ScrollPaneConstants;
 import javax.swing.SwingConstants;
-import javax.swing.SwingUtilities;
 import javax.swing.Timer;
 import javax.swing.border.EmptyBorder;
 import net.runelite.client.ui.ColorScheme;
@@ -69,8 +69,8 @@ public final class TradeWindow extends JFrame
 	private final JLabel statusLabel = new JLabel(" ");
 	private final JButton acceptBtn = new JButton("Accept");
 	private final JButton cancelBtn = new JButton("Cancel");
-	private static final int IMAGE_REPAINT_DEBOUNCE_MS = 500;
-	private Timer imageRepaintDebounceTimer;
+	private static final int IMAGE_REPAINT_COALESCE_MS = 200;
+	private ImageRepaintCoalescer imageRepaintCoalescer;
 	private final Consumer<String> imageLoadListener = this::onWikiImageLoaded;
 	private final Timer foilAnimTimer;
 	private boolean suppressCloseCancel;
@@ -145,7 +145,7 @@ public final class TradeWindow extends JFrame
 			}
 		});
 
-		imageRepaintDebounceTimer = new Timer(IMAGE_REPAINT_DEBOUNCE_MS, e ->
+		imageRepaintCoalescer = new ImageRepaintCoalescer(IMAGE_REPAINT_COALESCE_MS, () ->
 		{
 			if (isShowing())
 			{
@@ -153,7 +153,6 @@ public final class TradeWindow extends JFrame
 				remotePanel.repaint();
 			}
 		});
-		imageRepaintDebounceTimer.setRepeats(false);
 		this.imageCacheService.addLoadListener(imageLoadListener);
 	}
 
@@ -317,9 +316,9 @@ public final class TradeWindow extends JFrame
 		suppressCloseCancel = true;
 		imageCacheService.removeLoadListener(imageLoadListener);
 		foilAnimTimer.stop();
-		if (imageRepaintDebounceTimer != null)
+		if (imageRepaintCoalescer != null)
 		{
-			imageRepaintDebounceTimer.stop();
+			imageRepaintCoalescer.stop();
 		}
 		dispose();
 	}
@@ -333,18 +332,12 @@ public final class TradeWindow extends JFrame
 
 	private void onWikiImageLoaded(String normalizedUrl)
 	{
-		if (normalizedUrl == null || normalizedUrl.isEmpty() || !isShowing())
+		// Listener runs on a loader thread; the coalescer callback checks isShowing on the EDT.
+		if (normalizedUrl == null || normalizedUrl.isEmpty())
 		{
 			return;
 		}
-		SwingUtilities.invokeLater(() ->
-		{
-			if (!isShowing())
-			{
-				return;
-			}
-			imageRepaintDebounceTimer.restart();
-		});
+		imageRepaintCoalescer.signal();
 	}
 
 	private void onAcceptClicked()

@@ -87,8 +87,8 @@ public final class CollectionAlbumWindow extends JFrame
 		"You and the recipient must both be in the same RuneLite party with OSRS TCG installed to send cards.";
 	private static final String LOCKED_CARD_ACTION_TOOLTIP = AlbumInstanceTooltip.LOCKED_ACTION_HINT;
 	private static final int PAGE_SIZE = 21;
-	/** Quiet period after the last visible wiki-image load before one coalesced album repaint. */
-	private static final int IMAGE_REPAINT_DEBOUNCE_MS = 500;
+	/** Rapid page flips settle for this long before their loads enqueue (see {@link #schedulePagePreload}). */
+	private static final int PAGE_PRELOAD_SETTLE_MS = 80;
 	private static final String RARITY_FILTER_ALL = "All";
 	private static final List<String> RARITY_TIERS_LOW_TO_HIGH = List.of(
 		"Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Godly");
@@ -136,11 +136,7 @@ public final class CollectionAlbumWindow extends JFrame
 	private final JPanel albumCenterHost = new JPanel(albumCenterLayout);
 	private final CollectionAlbumVariantsPanel variantsPanel;
 	private Timer searchDebounceTimer;
-	/**
-	 * Debounces wiki-image load completions: restart on each visible-card arrival, then one
-	 * grid repaint after quiet. Avoids flooding the AWT queue (shared with client mouse/camera).
-	 */
-	private Timer imageRepaintDebounceTimer;
+	private Timer pagePreloadTimer;
 	private final Consumer<String> imageLoadListener = this::onWikiImageLoaded;
 	/** High-rate foil sparkle/sheen repaints while foil cards are visible. */
 	private final Timer foilAnimTimer;
@@ -552,19 +548,6 @@ public final class CollectionAlbumWindow extends JFrame
 			}
 		});
 
-		imageRepaintDebounceTimer = new Timer(IMAGE_REPAINT_DEBOUNCE_MS, e ->
-		{
-			if (!isShowing())
-			{
-				return;
-			}
-			grid.refreshFacesAfterImageLoad();
-			if (albumVariantsVisible)
-			{
-				variantsPanel.repaint();
-			}
-		});
-		imageRepaintDebounceTimer.setRepeats(false);
 		imageCacheService.addLoadListener(imageLoadListener);
 
 		// Continuous foil animation; paint path only blits cached faces + cheap overlays.
@@ -623,8 +606,8 @@ public final class CollectionAlbumWindow extends JFrame
 	}
 
 	/**
-	 * Show the frame only after the next successful model apply (images awaited off-EDT).
-	 * Avoids overlapping first-open disk decode GC with client middle-mouse camera input.
+	 * Show the frame only after the next successful model apply, so the first visible
+	 * frame is a laid-out page (art streams in progressively after).
 	 */
 	void requestShowWhenPageReady()
 	{
@@ -740,9 +723,9 @@ public final class CollectionAlbumWindow extends JFrame
 	{
 		partyUiTimer.stop();
 		foilAnimTimer.stop();
-		if (imageRepaintDebounceTimer != null)
+		if (pagePreloadTimer != null)
 		{
-			imageRepaintDebounceTimer.stop();
+			pagePreloadTimer.stop();
 		}
 		if (searchDebounceTimer != null)
 		{
@@ -788,8 +771,9 @@ public final class CollectionAlbumWindow extends JFrame
 	}
 
 	/**
-	 * Visible wiki-image arrivals only. Repaint once when every currently shown URL has settled,
-	 * so decode bursts do not spam the AWT queue shared with client mouse/camera.
+	 * Visible wiki-image arrivals only. Each re-renders exactly the face(s) using that URL
+	 * (one ~1ms raster job + one blit repaint), so art paints the moment it lands without
+	 * touching the rest of the page.
 	 */
 	private void onWikiImageLoaded(String normalizedUrl)
 	{
@@ -802,20 +786,17 @@ public final class CollectionAlbumWindow extends JFrame
 		{
 			return;
 		}
-		for (String url : visible)
-		{
-			if (!imageCacheService.isSettled(url))
-			{
-				return;
-			}
-		}
 		SwingUtilities.invokeLater(() ->
 		{
 			if (!isShowing())
 			{
 				return;
 			}
-			imageRepaintDebounceTimer.restart();
+			grid.refreshFaceForUrl(normalizedUrl);
+			if (albumVariantsVisible)
+			{
+				variantsPanel.repaint();
+			}
 		});
 	}
 
@@ -1066,11 +1047,6 @@ public final class CollectionAlbumWindow extends JFrame
 		ForkJoinPool.commonPool().execute(() ->
 		{
 			List<CardDefinition> working = computeFilteredSortedCards(inputs);
-			int pages = Math.max(1, (working.size() + PAGE_SIZE - 1) / PAGE_SIZE);
-			int page = Math.max(0, Math.min(inputs.preservePageIndex, pages - 1));
-			int from = page * PAGE_SIZE;
-			int to = Math.min(from + PAGE_SIZE, working.size());
-			imageCacheService.preloadAndAwait(imageUrlsBetween(working, from, to), 8_000L);
 			SwingUtilities.invokeLater(() -> applyModelRebuild(gen, inputs.preservePageIndex, working));
 		});
 	}
@@ -1128,8 +1104,7 @@ public final class CollectionAlbumWindow extends JFrame
 		filteredTotal = working.size();
 		pageCount = Math.max(1, (filteredTotal + PAGE_SIZE - 1) / PAGE_SIZE);
 		pageIndex = Math.max(0, Math.min(preservePageIndex, pageCount - 1));
-		// Images for this page were awaited off-EDT in scheduleModelRebuild.
-		refreshCurrentPage(true);
+		refreshCurrentPage();
 		finishPendingShow();
 	}
 
@@ -1254,17 +1229,12 @@ public final class CollectionAlbumWindow extends JFrame
 		return working;
 	}
 
-	/** Updates the visible page from {@link #filteredSortedCards} without re-filtering or re-sorting. */
-	private void refreshCurrentPage()
-	{
-		refreshCurrentPage(false);
-	}
-
 	/**
-	 * @param imagesPreloaded when false, may bounce through a background preload-await so the EDT
-	 *                        paint runs with art already in memory (avoids decode GC during camera use).
+	 * Updates the visible page from {@link #filteredSortedCards} without re-filtering or
+	 * re-sorting. Applies immediately: faces without art render the built-in placeholder
+	 * and repaint progressively as loads settle (via {@link #imageRepaintCoalescer}).
 	 */
-	private void refreshCurrentPage(boolean imagesPreloaded)
+	private void refreshCurrentPage()
 	{
 		if (filteredSortedCards.isEmpty())
 		{
@@ -1277,25 +1247,7 @@ public final class CollectionAlbumWindow extends JFrame
 		pageIndex = Math.max(0, Math.min(pageIndex, pageCount - 1));
 		int from = pageIndex * PAGE_SIZE;
 		int to = Math.min(from + PAGE_SIZE, filteredTotal);
-		List<String> pageUrls = imageUrlsBetween(filteredSortedCards, from, to);
-		if (!imagesPreloaded && pageUrls.stream().anyMatch(u -> !imageCacheService.isSettled(u)))
-		{
-			final int pageSnap = pageIndex;
-			final long gen = modelRebuildGen.get();
-			ForkJoinPool.commonPool().execute(() ->
-			{
-				imageCacheService.preloadAndAwait(pageUrls, 6_000L);
-				SwingUtilities.invokeLater(() ->
-				{
-					if (gen != modelRebuildGen.get() || pageSnap != pageIndex)
-					{
-						return;
-					}
-					refreshCurrentPage(true);
-				});
-			});
-			return;
-		}
+		schedulePagePreload();
 
 		Map<CardCollectionKey, Integer> owned = stateService.getState().getCollectionState().getOwnedCards();
 		Set<String> collected = collectedNamesFromOwned(owned);
@@ -1345,40 +1297,74 @@ public final class CollectionAlbumWindow extends JFrame
 		grid.setSlots(slots, selectionPreserveIndex(slots));
 		updatePageControls(from, to);
 		updateAlbumRepaintTimers();
-		prefetchAdjacentPageImages();
 	}
 
-	/** Warms the neighbor page's images in the background so the next page-turn paints instantly. */
-	private void prefetchAdjacentPageImages()
+	/**
+	 * Leading edge loads a single page-turn's images immediately; during a rapid flip
+	 * burst only the page the user lands on enqueues (after {@link #PAGE_PRELOAD_SETTLE_MS}
+	 * of no further turns), so skipped-past pages never reach the loader queue.
+	 */
+	private void schedulePagePreload()
 	{
-		int target = adjacentPrefetchPage(pageIndex, pageCount, lastPageStep);
-		if (target < 0)
+		if (pagePreloadTimer == null)
 		{
-			return;
+			pagePreloadTimer = new Timer(PAGE_PRELOAD_SETTLE_MS, e ->
+			{
+				preloadCurrentPageImages();
+				prefetchAdjacentPageImages();
+			});
+			pagePreloadTimer.setRepeats(false);
 		}
-		int from = target * PAGE_SIZE;
+		if (!pagePreloadTimer.isRunning())
+		{
+			preloadCurrentPageImages();
+		}
+		pagePreloadTimer.restart();
+	}
+
+	private void preloadCurrentPageImages()
+	{
+		int from = pageIndex * PAGE_SIZE;
 		int to = Math.min(from + PAGE_SIZE, filteredSortedCards.size());
 		imageCacheService.preload(imageUrlsBetween(filteredSortedCards, from, to));
 	}
 
+	/** Warms the next pages' images in the background so upcoming page-turns paint instantly. */
+	private void prefetchAdjacentPageImages()
+	{
+		for (int target : prefetchPages(pageIndex, pageCount, lastPageStep))
+		{
+			int from = target * PAGE_SIZE;
+			int to = Math.min(from + PAGE_SIZE, filteredSortedCards.size());
+			imageCacheService.preload(imageUrlsBetween(filteredSortedCards, from, to));
+		}
+	}
+
 	/**
-	 * Page to prefetch after landing on {@code pageIndex}: the neighbor in the direction of
-	 * travel, the opposite neighbor at either end, or -1 when no other page exists.
+	 * Pages to prefetch after landing on {@code pageIndex}: the next two in the direction
+	 * of travel, the opposite neighbor at either end, or nothing when no other page exists.
 	 */
-	static int adjacentPrefetchPage(int pageIndex, int pageCount, int lastStep)
+	static List<Integer> prefetchPages(int pageIndex, int pageCount, int lastStep)
 	{
 		int step = lastStep < 0 ? -1 : 1;
-		int target = pageIndex + step;
-		if (target >= 0 && target < pageCount)
+		List<Integer> targets = new ArrayList<>(2);
+		for (int depth = 1; depth <= 2; depth++)
 		{
-			return target;
+			int target = pageIndex + depth * step;
+			if (target >= 0 && target < pageCount)
+			{
+				targets.add(target);
+			}
 		}
-		target = pageIndex - step;
-		if (target >= 0 && target < pageCount)
+		if (targets.isEmpty())
 		{
-			return target;
+			int opposite = pageIndex - step;
+			if (opposite >= 0 && opposite < pageCount)
+			{
+				targets.add(opposite);
+			}
 		}
-		return -1;
+		return targets;
 	}
 
 	private void updatePageControls(int from, int to)
