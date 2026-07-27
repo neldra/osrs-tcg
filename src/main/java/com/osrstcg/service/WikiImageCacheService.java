@@ -19,7 +19,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -34,6 +33,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
+import java.util.function.LongSupplier;
 import javax.imageio.ImageIO;
 import javax.imageio.ImageReadParam;
 import javax.imageio.ImageReader;
@@ -69,6 +69,8 @@ public class WikiImageCacheService
 	private static final int MAX_MEMORY_IMAGE_EDGE_PX = 130;
 	/** Cap concurrent disk/network decodes so album open cannot flood the heap/CPU. */
 	private static final int MAX_IN_FLIGHT_LOADS = 4;
+	/** How long a failed URL is left alone before the lazy paint path may retry it. */
+	private static final long FAILED_RETRY_COOLDOWN_MS = 60_000L;
 	private static final AtomicInteger IMAGE_LOADER_SEQ = new AtomicInteger();
 	private static final ThreadFactory IMAGE_LOADER_THREAD_FACTORY = r ->
 	{
@@ -80,6 +82,8 @@ public class WikiImageCacheService
 	private final OkHttpClient okHttpClient;
 	private final Path diskCacheDir;
 	private final long memoryBudgetBytes;
+	/** Time source for the failed-URL retry cooldown; injectable for tests. */
+	private final LongSupplier clock;
 	private final Semaphore loadPermits = new Semaphore(MAX_IN_FLIGHT_LOADS);
 	/** Dedicated pool so blocking ImageIO/HTTP does not stall the common ForkJoinPool. */
 	private final ExecutorService imageLoadExecutor = Executors.newFixedThreadPool(
@@ -100,8 +104,13 @@ public class WikiImageCacheService
 			t.setDaemon(true);
 			return t;
 		});
-	/** URLs that failed to load; skip re-fetching on the overlay/album paint path. */
-	private final Set<String> failedUrls = ConcurrentHashMap.newKeySet();
+	/**
+	 * URLs that failed to load, mapped to the failure time. The overlay/album paint path
+	 * skips them while the retry cooldown runs; {@link #getCached} retries afterwards, so a
+	 * transient outage (Cloudflare challenge, offline start) heals without a client restart.
+	 */
+	private final Map<String, Long> failedUrls = new ConcurrentHashMap<>();
+	private final WikiImageFailureLog failureLog = new WikiImageFailureLog();
 	/**
 	 * Fired on the loader thread after each URL settles (cached or failed), with the normalized URL.
 	 * Keep listeners cheap; they may run off the EDT.
@@ -118,9 +127,15 @@ public class WikiImageCacheService
 
 	WikiImageCacheService(OkHttpClient okHttpClient, Path diskCacheDir, long memoryBudgetBytes)
 	{
+		this(okHttpClient, diskCacheDir, memoryBudgetBytes, System::currentTimeMillis);
+	}
+
+	WikiImageCacheService(OkHttpClient okHttpClient, Path diskCacheDir, long memoryBudgetBytes, LongSupplier clock)
+	{
 		this.okHttpClient = okHttpClient;
 		this.diskCacheDir = diskCacheDir;
 		this.memoryBudgetBytes = memoryBudgetBytes;
+		this.clock = clock;
 	}
 
 	/** Register for image load completion. Listener may run off the EDT; argument is the normalized URL. */
@@ -231,7 +246,20 @@ public class WikiImageCacheService
 		String normalized = normalizeUrl(url);
 		return normalized.isEmpty()
 			|| memoryCache.containsKey(normalized)
-			|| failedUrls.contains(normalized);
+			|| failedUrls.containsKey(normalized);
+	}
+
+	/**
+	 * True when the URL's last load terminally failed and no retry has succeeded since.
+	 * Stays true across the retry cooldown so the UI can show a stable failed state.
+	 */
+	public boolean isFailed(String url)
+	{
+		if (url == null)
+		{
+			return false;
+		}
+		return failedUrls.containsKey(normalizeUrl(url));
 	}
 
 	/** True when the image is not yet available in memory (not started or still loading). */
@@ -243,7 +271,7 @@ public class WikiImageCacheService
 		}
 
 		String normalized = normalizeUrl(url);
-		if (normalized.isEmpty() || memoryCache.containsKey(normalized) || failedUrls.contains(normalized))
+		if (normalized.isEmpty() || memoryCache.containsKey(normalized) || failedUrls.containsKey(normalized))
 		{
 			return false;
 		}
@@ -362,11 +390,18 @@ public class WikiImageCacheService
 			return cached;
 		}
 
-		if (!failedUrls.contains(normalized))
+		if (!isInFailureCooldown(normalized))
 		{
 			ensureLoad(normalized);
 		}
 		return null;
+	}
+
+	/** True while a failed URL waits out {@link #FAILED_RETRY_COOLDOWN_MS} before a retry. */
+	private boolean isInFailureCooldown(String normalizedUrl)
+	{
+		Long failedAt = failedUrls.get(normalizedUrl);
+		return failedAt != null && clock.getAsLong() - failedAt < FAILED_RETRY_COOLDOWN_MS;
 	}
 
 	private void ensureLoad(String rawUrl)
@@ -374,7 +409,7 @@ public class WikiImageCacheService
 		String url = normalizeUrl(rawUrl);
 		if (url.isEmpty()
 			|| memoryCache.containsKey(url)
-			|| failedUrls.contains(url)
+			|| isInFailureCooldown(url)
 			|| loadingFutures.containsKey(url))
 		{
 			return;
@@ -404,7 +439,7 @@ public class WikiImageCacheService
 				}
 				else
 				{
-					failedUrls.add(key);
+					failedUrls.put(key, clock.getAsLong());
 				}
 				loadingFutures.remove(key);
 				notifyLoadListeners(key);
@@ -465,9 +500,11 @@ public class WikiImageCacheService
 		List<String> candidates = buildCandidateUrls(url);
 		if (candidates.isEmpty())
 		{
+			reportTerminalFailure(url, "no fetchable URL");
 			return null;
 		}
 
+		String cause = "unreadable image data";
 		for (String candidate : candidates)
 		{
 			try
@@ -481,11 +518,14 @@ public class WikiImageCacheService
 					if (!response.isSuccessful() || response.body() == null)
 					{
 						log.debug("Wiki image HTTP {} for {}", response.code(), candidate);
+						String cfRay = response.header("cf-ray");
+						cause = "HTTP " + response.code() + (cfRay != null ? " (cf-ray " + cfRay + ")" : "");
 						continue;
 					}
 					try (InputStream inputStream = response.body().byteStream())
 					{
 						BufferedImage image = ImageIO.read(inputStream);
+						cause = "unreadable image data";
 						if (image != null)
 						{
 							persistToDisk(url, image);
@@ -506,9 +546,25 @@ public class WikiImageCacheService
 			catch (Exception ex)
 			{
 				log.debug("Failed to cache image candidate {}", candidate, ex);
+				cause = ex.getClass().getSimpleName();
 			}
 		}
+		reportTerminalFailure(url, cause);
 		return null;
+	}
+
+	/**
+	 * Emits the folded failure report. The cause names the last candidate's outcome —
+	 * HTTP status plus Cloudflare ray id when present, or the exception class — which is
+	 * the evidence a support ticket needs to tell "blocked" from "offline" apart.
+	 */
+	private void reportTerminalFailure(String url, String cause)
+	{
+		String line = failureLog.record(url, cause, clock.getAsLong());
+		if (line != null)
+		{
+			log.warn(line);
+		}
 	}
 
 	/**

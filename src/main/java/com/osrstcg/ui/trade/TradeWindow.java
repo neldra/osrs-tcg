@@ -484,8 +484,10 @@ public final class TradeWindow extends JFrame
 					TradeOfferView offer = offers.get(i);
 					CardDefinition card = cardDatabase.findByName(offer.getCardName()).orElse(null);
 					Color rarity = cardDatabase.chatRarityColorForCardName(offer.getCardName());
-					BufferedImage art = imageCacheService.getCached(card == null ? null : card.getImageUrl());
-					SharedCardRenderer.drawCardFace(g2, bounds, card, offer.isFoil(), rarity, art, 0L, offer.isFoil());
+					String imageUrl = card == null ? null : card.getImageUrl();
+					BufferedImage art = imageCacheService.getCached(imageUrl);
+					SharedCardRenderer.drawCardFace(g2, bounds, card, offer.isFoil(), rarity, art, 0L, offer.isFoil(), true,
+						imageCacheService.isFailed(imageUrl));
 				}
 			}
 			finally

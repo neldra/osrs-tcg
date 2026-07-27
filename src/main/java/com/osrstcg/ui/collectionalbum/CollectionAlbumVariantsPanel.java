@@ -392,9 +392,11 @@ public final class CollectionAlbumVariantsPanel extends JPanel
 						continue;
 					}
 					OwnedCardInstance inst = allCopies.get(gi);
-					BufferedImage art = imageCacheService.getCached(card == null ? null : card.getImageUrl());
+					String imageUrl = card == null ? null : card.getImageUrl();
+					BufferedImage art = imageCacheService.getCached(imageUrl);
 					boolean foil = inst.isFoil();
-					SharedCardRenderer.drawCardFace(g2, bounds, card, foil, rarityColor, art, 0L, foil);
+					SharedCardRenderer.drawCardFace(g2, bounds, card, foil, rarityColor, art, 0L, foil, true,
+						imageCacheService.isFailed(imageUrl));
 					if (inst.isLocked())
 					{
 						SharedCardRenderer.drawLockBadge(g2, bounds);

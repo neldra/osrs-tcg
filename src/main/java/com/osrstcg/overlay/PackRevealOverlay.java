@@ -245,7 +245,8 @@ public class PackRevealOverlay extends Overlay
 			}
 			if (faceUp)
 			{
-				BufferedImage linked = imageCacheService.getCached(card.getDefinition() == null ? null : card.getDefinition().getImageUrl());
+				String imageUrl = card.getDefinition() == null ? null : card.getDefinition().getImageUrl();
+				BufferedImage linked = imageCacheService.getCached(imageUrl);
 				SharedCardRenderer.drawCardFace(
 					graphics,
 					r,
@@ -254,7 +255,9 @@ public class PackRevealOverlay extends Overlay
 					card.getRarityColor(),
 					linked,
 					card.getBasePullDenominator(),
-					card.getPull().isFoil());
+					card.getPull().isFoil(),
+					true,
+					imageCacheService.isFailed(imageUrl));
 			}
 			else
 			{
