@@ -9,10 +9,17 @@ import java.awt.image.BufferedImage;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.security.MessageDigest;
+import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import javax.imageio.ImageIO;
 import javax.swing.SwingUtilities;
+import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
+import okhttp3.Protocol;
+import okhttp3.Response;
+import okhttp3.ResponseBody;
 import org.junit.Assert;
 import org.junit.Rule;
 import org.junit.Test;
@@ -73,6 +80,59 @@ public class CollectionAlbumGridProgressiveTest
 			hasRenderedFace(paint(panel[0])));
 		Assert.assertTrue("the arrived art should appear", awaitCondition(
 			() -> hasArt(paint(panel[0]))));
+	}
+
+	@Test
+	public void terminalArtFailureRepaintsTheFaceAsUnavailable() throws Exception
+	{
+		// Candidate-URL fallbacks would rewrite URL_A onto the real wiki host; the
+		// interceptor keeps every request in-process (and failing).
+		OkHttpClient blocked = new OkHttpClient.Builder()
+			.addInterceptor(chain -> new Response.Builder()
+				.request(chain.request())
+				.protocol(Protocol.HTTP_1_1)
+				.code(403)
+				.message("Forbidden")
+				.body(ResponseBody.create(MediaType.get("text/html"), "blocked"))
+				.build())
+			.build();
+		WikiImageCacheService images = TestWikiImageCaches.withCacheDirAndClient(tmp.getRoot().toPath(), blocked);
+		CollectionAlbumGridPanel[] panel = new CollectionAlbumGridPanel[1];
+		SwingUtilities.invokeAndWait(() ->
+		{
+			panel[0] = new CollectionAlbumGridPanel(images, (i, s) ->
+			{
+			}, s ->
+			{
+			}, () ->
+			{
+			}, s ->
+			{
+			});
+			panel[0].setSize(600, 400);
+			panel[0].setSlots(List.of(slot("Alpha card", URL_A)));
+		});
+
+		Assert.assertTrue("initial face rasters should render", awaitCondition(
+			() -> hasRenderedFace(paint(panel[0]))));
+		int[] loadingPixels = pixels(paint(panel[0]));
+
+		// Drive the load to terminal failure (unroutable host), as the album's settle listener would see it.
+		CountDownLatch settled = new CountDownLatch(1);
+		images.addLoadListener(u -> settled.countDown());
+		images.getCached(URL_A);
+		Assert.assertTrue("load should settle", settled.await(10, TimeUnit.SECONDS));
+		Assert.assertTrue("load should have failed", images.isFailed(URL_A));
+
+		SwingUtilities.invokeAndWait(() ->
+			panel[0].refreshFaceForUrl(images.normalizeImageUrl(URL_A)));
+		Assert.assertTrue("the failed face must repaint differently from the loading face",
+			awaitCondition(() -> !Arrays.equals(loadingPixels, pixels(paint(panel[0])))));
+	}
+
+	private static int[] pixels(BufferedImage img)
+	{
+		return img.getRGB(0, 0, img.getWidth(), img.getHeight(), null, 0, img.getWidth());
 	}
 
 	private static AlbumSlot slot(String name, String imageUrl)

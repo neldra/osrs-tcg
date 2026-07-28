@@ -471,8 +471,8 @@ final class CollectionAlbumGridPanel extends JPanel
 		try
 		{
 			CardDefinition card = slot == null ? null : slot.card();
-			drawStaticFace(g2, new Rectangle(0, 0, cW, cH), slot,
-				slotArt(card == null ? null : card.getImageUrl()));
+			String url = card == null ? null : card.getImageUrl();
+			drawStaticFace(g2, new Rectangle(0, 0, cW, cH), slot, slotArt(url), imageCacheService.isFailed(url));
 		}
 		finally
 		{
@@ -482,7 +482,7 @@ final class CollectionAlbumGridPanel extends JPanel
 	}
 
 	/** Static face only — animated foil overlays are drawn on the EDT blit path. */
-	private static void drawStaticFace(Graphics2D g2, Rectangle bounds, AlbumSlot slot, BufferedImage art)
+	private static void drawStaticFace(Graphics2D g2, Rectangle bounds, AlbumSlot slot, BufferedImage art, boolean artFailed)
 	{
 		CardDefinition card = slot == null ? null : slot.card();
 		Color rarity = slot == null ? Color.WHITE : slot.rarityColor();
@@ -494,7 +494,7 @@ final class CollectionAlbumGridPanel extends JPanel
 		{
 			g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, 0.3f));
 		}
-		SharedCardRenderer.drawCardFace(g2, bounds, card, foil, rarity, art, 0L, foilScoreLabel, false);
+		SharedCardRenderer.drawCardFace(g2, bounds, card, foil, rarity, art, 0L, foilScoreLabel, false, artFailed);
 		if (slot != null && slot.lockBadge())
 		{
 			SharedCardRenderer.drawLockBadge(g2, bounds);
@@ -600,7 +600,7 @@ final class CollectionAlbumGridPanel extends JPanel
 					{
 						// Warm art paints the same frame the page applies; the raster
 						// swaps in underneath on a later frame.
-						drawStaticFace(g2, bounds, slot, art);
+						drawStaticFace(g2, bounds, slot, art, false);
 					}
 					else
 					{

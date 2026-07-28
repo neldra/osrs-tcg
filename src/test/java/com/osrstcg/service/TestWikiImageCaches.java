@@ -19,4 +19,10 @@ public final class TestWikiImageCaches
 	{
 		return new WikiImageCacheService(new OkHttpClient(), dir, memoryBudgetBytes);
 	}
+
+	/** For tests that exercise the network path: candidate URLs never leave the given client. */
+	public static WikiImageCacheService withCacheDirAndClient(Path dir, OkHttpClient client)
+	{
+		return new WikiImageCacheService(client, dir, 32L * 1024 * 1024);
+	}
 }

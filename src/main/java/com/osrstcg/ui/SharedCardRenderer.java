@@ -119,6 +119,17 @@ public final class SharedCardRenderer
 	public static void drawCardFace(Graphics2D g, Rectangle bounds, CardDefinition card, boolean foil, Color rarityColor, BufferedImage linkedImage, long basePullDenominator,
 		boolean useFoilAdjustedScoreForLabel, boolean drawFoilOverlays)
 	{
+		drawCardFace(g, bounds, card, foil, rarityColor, linkedImage, basePullDenominator, useFoilAdjustedScoreForLabel, drawFoilOverlays, false);
+	}
+
+	/**
+	 * @param artFailed when true and no art is linked, the image section reads "Artwork unavailable"
+	 *                  instead of "Loading artwork..." (the load terminally failed; a cooldown retry
+	 *                  may still recover it later).
+	 */
+	public static void drawCardFace(Graphics2D g, Rectangle bounds, CardDefinition card, boolean foil, Color rarityColor, BufferedImage linkedImage, long basePullDenominator,
+		boolean useFoilAdjustedScoreForLabel, boolean drawFoilOverlays, boolean artFailed)
+	{
 		if (g == null || bounds == null)
 		{
 			return;
@@ -165,7 +176,7 @@ public final class SharedCardRenderer
 			drawCenteredText(g2, titleR, valueOrFallback(card == null ? null : card.getName(), "Unknown Card"),
 				FontManager.getRunescapeSmallFont(), safeColor(rarityColor).brighter(), 2);
 
-			drawImageSection(g2, imageR, card, linkedImage);
+			drawImageSection(g2, imageR, card, linkedImage, artFailed);
 
 			String rarity = tierLabelForRarityColor(safeColor(rarityColor));
 			drawCenteredText(g2, tierR, rarity, FontManager.getRunescapeSmallFont(), safeColor(rarityColor).brighter());
@@ -625,7 +636,7 @@ public final class SharedCardRenderer
 		}
 	}
 
-	private static void drawImageSection(Graphics2D g2, Rectangle imageRect, CardDefinition card, BufferedImage linkedImage)
+	private static void drawImageSection(Graphics2D g2, Rectangle imageRect, CardDefinition card, BufferedImage linkedImage, boolean artFailed)
 	{
 		if (linkedImage != null)
 		{
@@ -633,9 +644,17 @@ public final class SharedCardRenderer
 			return;
 		}
 
+		drawCenteredText(g2, imageRect, artPlaceholderText(card, artFailed), FontManager.getRunescapeSmallFont(), ColorScheme.LIGHT_GRAY_COLOR);
+	}
+
+	static String artPlaceholderText(CardDefinition card, boolean artFailed)
+	{
 		String imageUrl = card == null ? null : card.getImageUrl();
-		String artText = (imageUrl != null && !imageUrl.trim().isEmpty()) ? "Loading artwork..." : "No artwork";
-		drawCenteredText(g2, imageRect, artText, FontManager.getRunescapeSmallFont(), ColorScheme.LIGHT_GRAY_COLOR);
+		if (imageUrl == null || imageUrl.trim().isEmpty())
+		{
+			return "No artwork";
+		}
+		return artFailed ? "Artwork unavailable" : "Loading artwork...";
 	}
 
 	private static Rectangle inset(Rectangle r, int pad)
